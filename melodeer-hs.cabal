@@ -1,0 +1,13 @@
+cabal-version: 3.0
+name: melodeer-hs
+version: 8.10
+
+executable melodeer-hs
+    main-is: Main.hs
+    build-depends:
+        base >= 4.8,
+        flac >= 0.2.0,
+      --  unix >= 2.7,
+        directory >= 1.3,
+        text >= 1.2,
+        process >= 1.6
