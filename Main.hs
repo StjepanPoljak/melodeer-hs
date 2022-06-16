@@ -7,7 +7,7 @@ import System.Directory (removeFile, getCurrentDirectory)
 import Control.Concurrent (forkIO, threadDelay, ThreadId)
 import Data.Text (Text, pack, unpack)
 import System.Process
-import Control.Monad (liftM, void, mzero)
+import Control.Monad (liftM, void, mzero, unless, when, join, mapM_)
 import MDSem
 import MDBuff
 import System.IO (openBinaryFile, Handle, IOMode(..), hClose, hGetBuf, hIsEOF)
@@ -15,11 +15,22 @@ import Control.Monad.Trans.Maybe (MaybeT(..), runMaybeT)
 import Control.Monad.Trans.Reader (ReaderT(..), runReaderT, ask)
 import Foreign.Marshal.Alloc (callocBytes)
 import Sound.OpenAL
-import qualified Data.Map as Map (fromList, (!?))
+import qualified Data.Map as Map (fromList, (!?), (!))
+import Data.Maybe (isNothing, fromJust)
 
-data MDData = MDData Source [Buffer] Handle MDBuffT
+data MDData = MDData { source       :: Source
+                     , buffers      :: [Buffer]
+                     , handle       :: Handle
+                     , mdbuffer     :: MDBuffT
+                     }
 
 type PlayFileT = FilePath -> MDMeta -> IO () -> ReaderT MDOpts IO ()
+
+data MDDriver = MDPacat | MDOpenAL deriving (Eq)
+
+data MDDelay = MDDelay { coeff      :: Double
+                       , offset     :: Double
+                       } deriving (Eq, Show)
 
 data MDOpts = MDOpts { buffNum      :: Int
                      , buffSize     :: Int
@@ -27,6 +38,8 @@ data MDOpts = MDOpts { buffNum      :: Int
                      , playlist     :: [(Int, FilePath)]
                      , plistLen     :: Int
                      , allsem       :: MDSemT
+                     , driver       :: MDDriver
+                     , delay        :: MDDelay
                      }
 
 data MDMeta = MDMeta { channels     :: Int
@@ -69,14 +82,27 @@ getMetadata fname = runFlacMeta defaultMetaSettings fname $ do
     return $ MDMeta (fromIntegral ch) (fromIntegral bps) (fromIntegral sr)
                     dur (getMetaString tit) (getMetaString art)
 
-mapMeta :: String -> MDMeta -> String
-mapMeta str meta = case str of
-    "%c"    -> show $ channels meta
-    "%b"    -> show $ bps meta
-    "%s"    -> show $ sampleRate meta
-    "%d"    -> show $ getDurationPretty $ duration meta
-    "%t"    -> unpack $ title meta
-    "%a"    -> unpack $ artist meta
+metaList = [ ('c', ( (\meta -> show $ channels meta)
+             , "channels")
+             )
+           , ('b', ( (\meta -> show $ bps meta)
+             , "bits per sample")
+             )
+           , ('s', ( (\meta -> show $ sampleRate meta)
+             , "sample rate")
+             )
+           , ('d', ( (\meta -> show $ getDurationPretty $ duration meta)
+             , "duration")
+             )
+           , ('t', ( (\meta -> unpack $ title meta)
+             , "song title")
+             )
+           , ('a', ( (\meta -> unpack $ artist meta)
+             , "song artist")
+             )
+           ]
+
+metaMap = Map.fromList metaList
 
 formatMeta :: String -> MDMeta -> String
 formatMeta part meta
@@ -88,9 +114,8 @@ formatMeta part meta
 
                 _       -> let (x:xs)   = part
                            in x:(formatMeta xs meta)
-
-defaultFormat :: String
-defaultFormat = "%a - %t\n%d"
+    where mapMeta :: String -> MDMeta -> String
+          mapMeta str meta = (fst $ metaMap Map.! (str !! 1)) meta
 
 getMetaString :: MetaType VorbisComment -> Text
 getMetaString Nothing = pack "Unknown"
@@ -117,18 +142,12 @@ getTemp = do
     hClose handle
     return fpath
 
-playFilePacat :: FilePath -> IO ()
-playFilePacat fpath = do
+playFilePacat :: FilePath -> MDMeta -> IO () -> ReaderT MDOpts IO ()
+playFilePacat fpath _ onPlay = liftIO $ do
+        onPlay
         (_, Just hout, _, _) <- createProcess (proc "cat" [ fpath ]) { std_out = CreatePipe }
         (_, _, _, ph) <- createProcess (proc "pacat" [] ) { std_in = UseHandle hout }
         void $ waitForProcess ph
-
-forkIOUntil :: Bool -> IO () -> IO (Maybe ThreadId)
-forkIOUntil True _ = do
-    return Nothing
-forkIOUntil False cb = do
-    tid <- forkIO cb
-    return (Just tid)
 
 startDecoding' :: [(Int, FilePath)] -> Maybe MDSemT -> PlayFileT
                -> ReaderT MDOpts IO ()
@@ -139,7 +158,7 @@ startDecoding' ((no, fname):xs) oldsem pf =
         sem     <- mdInitCond
         fpath   <- getTemp
         decodeFile fname fpath
-        cont    <- forkIOUntil (length xs == 0) $ do
+        unless (playlistEnd) $ void $ forkIO $ do
                         threadDelay . ((10^6) *)
                                     . floor
                                     . (0.75 *) . duration $ meta
@@ -153,7 +172,9 @@ startDecoding' ((no, fname):xs) oldsem pf =
                                   $ meta) opts
         mdSignalCond sem
         removeFile fpath
-        void $ maybe (mdSignalCond (allsem opts)) (\_ -> return ()) cont
+        when playlistEnd $ mdSignalCond (allsem opts)
+
+    where playlistEnd = length xs == 0
 
 startDecoding :: PlayFileT -> ReaderT MDOpts IO ()
 startDecoding pf = ask >>= \opts -> startDecoding' (playlist opts) Nothing pf
@@ -162,7 +183,7 @@ obtainResource :: IO (Maybe a) -> String -> IO () -> MaybeT IO a
 obtainResource res str act = liftIO res >>= maybe act' return
     where act' = do
             liftIO $ do
-                putStrLn str
+                when (length str > 0) $ putStrLn str
                 act
             mzero
 
@@ -188,57 +209,62 @@ withOpenAL action = ask >>= \opts -> liftIO $ void $ runMaybeT $ do
         runReaderT (action src bfs) opts
         deinitOpenAL dev ctx src bfs
 
-metaToOpenALFormat :: MDMeta -> Format
-metaToOpenALFormat meta =
-    case bps meta of
-        8   -> case channels meta of
-                1   -> Mono8
-                2   -> Stereo8
-        16  -> case channels meta of
-                1   -> Mono16
-                2   -> Stereo16
+metaToOpenALFormat :: MDMeta -> Maybe Format
+metaToOpenALFormat meta = Map.fromList [ ((8, 1), Mono8)
+                                        , ((8, 2), Stereo8)
+                                        , ((16, 1), Mono16)
+                                        , ((16, 2), Stereo16)
+                                        ] Map.!? (bps meta, channels meta)
 
-loadBuffs' :: Int -> MDData -> MDMeta -> Int -> Int -> IO MDBuffT
-loadBuffs' bfn mddata meta cnt bfsize
-    | cnt == 0      = return mdseq
+loadBuffs' :: Int -> MDData -> Int -> Format -> Int -> Int -> IO MDBuffT
+loadBuffs' bfn mddata rate format cnt bfsize
+    | cnt == 0      = return (mdbuffer mddata)
     | otherwise     =
-        hIsEOF hnd >>= \eof -> case eof of
-            True    -> return mdseq
-            False   -> do
-                ptr           <- callocBytes bfsize
-                buffCount     <- hGetBuf hnd ptr bfsize
+    hIsEOF (handle mddata) >>= \eof -> case eof of
 
-                let memReg    = MemoryRegion ptr (fromIntegral buffCount)
-                let mdNewSeq  = mdBuffAppend mdseq memReg
-                let mdNewData = MDData src bfs hnd mdNewSeq
+        True    -> return (mdbuffer mddata)
+        False   -> do
+           ptr           <- callocBytes bfsize
+           buffCount     <- hGetBuf (handle mddata) ptr bfsize
 
-                bufferData (bfs !! bfn) $= BufferData memReg
-                                                (metaToOpenALFormat meta)
-                                                (fromIntegral $ sampleRate meta)
+           let memReg     = MemoryRegion ptr (fromIntegral buffCount)
+           let mdNewSeq   = mdBuffAppend (mdbuffer mddata) memReg
 
-                case buffCount < bfsize of
-                      True        -> return mdNewSeq
-                      False       -> return
-                                 =<< loadBuffs' (bfn + 1) mdNewData meta
-                                                (cnt - 1) bfsize
+           bufferData ((buffers mddata) !! bfn) $= BufferData memReg format
+                                                   (fromIntegral $ rate)
 
-    where (MDData src bfs hnd mdseq) = mddata
+           case buffCount < bfsize of
+              True        -> return mdNewSeq
+              False       -> return
+                         =<< loadBuffs' (bfn + 1)
+                                        (mddata { mdbuffer = mdNewSeq })
+                                        rate format (cnt - 1) bfsize
 
-loadBuffs :: MDData -> MDMeta -> Int -> Int -> IO MDBuffT
+loadBuffs :: MDData -> Int -> Format -> Int -> Int -> IO MDBuffT
 loadBuffs = loadBuffs' 0
 
 playFile :: Source -> [Buffer] -> FilePath -> MDMeta -> IO ()
          -> ReaderT MDOpts IO ()
-playFile src bfs fpath meta onPlay = ask >>= \opts -> liftIO $ do
+playFile src bfs fpath meta onPlay
+    | isNothing fmt'    = liftIO $ putStrLn "Format not supported."
+    | otherwise         = ask >>= \opts -> liftIO $ do
+        let fmt  = fromJust fmt'
         hnd     <- openBinaryFile fpath ReadMode
-        let md  = (MDData src bfs hnd mdBuffInit)
-        mdbfs   <- loadBuffs md meta (buffNum opts) (buffSize opts)
-        let dl  = floor $ 10^6 * 0.5 * (getBufferDuration meta (buffSize opts))
+        let md   = MDData src bfs hnd mdBuffInit
+        mdbfs   <- loadBuffs md (sampleRate meta) fmt (buffNum opts)
+                             (buffSize opts)
+        let dl'  = (fromIntegral $ buffNum opts) * (coeff $ delay opts)
+                 + (offset $ delay opts)
+        let dl   = floor $ 10^6 * dl' * (getBufferDuration meta (buffSize opts))
+
         onPlay
         queueBuffers src (take (mdBuffSize mdbfs) bfs)
         play [src]
-        mdBuffDropAll =<< playLoop src hnd dl meta (buffSize opts) mdbfs
+        mdBuffDropAll =<< playLoop src hnd dl (sampleRate meta) fmt
+                                   (buffSize opts) mdbfs
         void $ hClose hnd
+
+    where fmt' = metaToOpenALFormat meta
 
 checkState :: Source -> IO ()
 checkState src = sourceState src >>= \st -> case st of
@@ -259,14 +285,14 @@ waitUntilDone src delay = sourceState src >>= \st -> case st of
         Stopped     -> return ()
         _           -> return ()
 
-playLoop :: Source -> Handle -> Int -> MDMeta -> Int -> MDBuffT -> IO MDBuffT
-playLoop src hnd delay meta bfsize mdseq = do
+playLoop :: Source -> Handle -> Int -> Int -> Format -> Int -> MDBuffT -> IO MDBuffT
+playLoop src hnd delay rate format bfsize mdseq = do
     threadDelay delay
     buffersProcessed src >>= \proc -> case proc > 0 of
         True    -> do
             bfs         <- unqueueBuffers src proc
-            let md      = MDData src bfs hnd mdseq
-            mdNewSeq    <- loadBuffs md meta (length bfs) bfsize
+            let md       = MDData src bfs hnd mdseq
+            mdNewSeq    <- loadBuffs md rate format (length bfs) bfsize
 
             let addedBuffCnt = (mdBuffSize mdNewSeq) - (mdBuffSize mdseq)
             case addedBuffCnt == 0 of
@@ -279,12 +305,26 @@ playLoop src hnd delay meta bfsize mdseq = do
                 False   -> do
                     queueBuffers src (take addedBuffCnt bfs)
                     checkState src
-                    return =<< playLoop src hnd delay meta bfsize
+                    return =<< playLoop src hnd delay rate format bfsize
                            =<< dropBuffers mdNewSeq
 
         False   -> do
             checkState src
-            return =<< playLoop src hnd delay meta bfsize mdseq
+            return =<< playLoop src hnd delay rate format bfsize mdseq
+
+instance Read MDDelay where
+    readsPrec _ str = maybe [] (\d -> [(d, "")]) (getDelayCoeff str)
+
+getDelayCoeff' :: (String, String) -> Char -> String -> Maybe MDDelay
+getDelayCoeff' (a, b) 'b' [] = Just $ MDDelay (read a :: Double) (read b :: Double)
+getDelayCoeff' (a, b) ch (x:xs)
+    | ch == 'a'     = case x of
+        ':'     -> getDelayCoeff' (a, b) 'b' xs
+        _       -> getDelayCoeff' (a ++ [x], b) ch xs
+    | ch == 'b'     = getDelayCoeff' (a, b ++ [x]) ch xs
+getDelayCoeff' _ _ _ = Nothing
+
+getDelayCoeff = getDelayCoeff' ("", "") 'a'
 
 optList = [ ('n', ( (\opts x -> opts { buffNum = read x :: Int } )
             , "number of buffers")
@@ -295,10 +335,52 @@ optList = [ ('n', ( (\opts x -> opts { buffNum = read x :: Int } )
           , ('f', ( (\opts x -> opts { format = x } )
             , "text format")
             )
-          , ('l', ( (\opts _ -> opts )
+          , ('l', ( idOpts
             , "open playlist file")
             )
+          , ('d', ( (\opts x -> opts { driver = Map.fromList
+                                             [ ("pacat", MDPacat)
+                                             , ("openal", MDOpenAL)
+                                             ] Map.! x } )
+            , "driver (pacat, openal)")
+            )
+          , ('t', ( (\opts x -> opts { delay = read x :: MDDelay } )
+            , "loop delay (a * buffNum + b)")
+            )
+          , ('h', ( idOpts
+            , "show help")
+            )
           ]
+    where idOpts opts _ = opts
+
+showHelpFor prefix = map (\(ch, (_, help)) -> "\t" ++ (prefix:ch:"\t") ++ help)
+
+showHelp = mapM_ putStrLn $ concat
+    [   [ "" ]
+        ,
+        [ "melodeer-hs is a simple FLAC player written in"
+        , "Haskell using OpenAL."
+        , ""
+        , "melodeer-hs <file_list> [-l <playlist_file>]"
+        , "\t\t[-d pacat|openal] [-f <text_format>]"
+        , "\t\t[-n <buff_num>] [-s <buff_size>]"
+        , "\t\t[-t <loop_delay>] [-h]"
+        , ""
+        , "Options:"
+        , ""
+        ], showHelpFor '-' optList,
+        [ ""
+        , "Loop delay is of format a:b (e.g. 0.0:0.5, which"
+        , "amounts to (0.0 * buffNum + 0.5) multiplied by"
+        , "single buffer time."
+        , ""
+        , "Text format can take following fields:"
+        , ""
+        ], showHelpFor '%' metaList
+        ,
+        [ "" ]
+    ]
+
 
 optMap = Map.fromList optList
 
@@ -315,41 +397,36 @@ getOpts' (Just ch) opts (x:xs) = case ch of
         in getOpts' Nothing (opts { playlist = newpl
                                   , plistLen = length newpl
                                   }) xs) =<< liftM lines (readFile x)
+    'h'     -> return Nothing
 
-    _       -> case optMap Map.!? ch of
-        Just val    -> return =<< getOpts' Nothing ((fst val) opts x) xs
-        Nothing     -> return Nothing
+    _       -> maybe (return Nothing)
+                     (\val -> getOpts' Nothing ((fst val) opts x) xs)
+                     (optMap Map.!? ch)
 
 getOpts :: MDOpts -> [String] -> IO (Maybe MDOpts)
 getOpts = getOpts' Nothing
 
 main :: IO ()
 main = getArgs >>= \args -> do
-            let pl      = zip [1..]
-                        . takeWhile (\x -> head x /= '-')
-                        $ args
-            let pllen   = length pl
-            let opts'   = drop pllen args
+            let pl       = zip [1..]
+                         . takeWhile (\x -> head x /= '-')
+                         $ args
+            let pllen    = length pl
+            let opts'    = drop pllen args
 
             allsem      <- mdInitCond
-            let defOpts = MDOpts 4 4096 defaultFormat pl pllen allsem
+            let defOpts  = MDOpts 4 4096 "%a - %t\n%d" pl pllen
+                                 allsem MDOpenAL (MDDelay 0.0 0.75)
 
             void $ liftIO $ runMaybeT $ do
-                opts <- obtainResource (getOpts defOpts opts')
-                        "Invalid command line arguments."
-                        mzero
+                opts    <- obtainResource (getOpts defOpts opts')
+                                          "" showHelp
 
-                liftIO $ putStrLn $ concat [ "buffSize = "
-                                           , show $ buffSize opts
-                                           , ", "
-                                           , "buffNum = "
-                                           , show $ buffNum opts
-                                           , ", "
-                                           , "format = "
-                                           , format opts
-                                           ]
+                void $ liftIO $ (flip runReaderT) opts $ case driver opts of
+                    MDOpenAL    -> withOpenAL $ \src bfs -> do
+                                        startDecoding (playFile src bfs)
+                                        liftIO $ mdWaitCond allsem
+                    MDPacat     -> do
+                            startDecoding playFilePacat
+                            liftIO $ mdWaitCond allsem
 
-                void $ liftIO $ (flip runReaderT) opts $
-                    withOpenAL $ \src bfs -> do
-                        startDecoding (playFile src bfs)
-                        liftIO $ mdWaitCond allsem
