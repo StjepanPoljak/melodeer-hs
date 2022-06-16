@@ -82,40 +82,54 @@ getMetadata fname = runFlacMeta defaultMetaSettings fname $ do
     return $ MDMeta (fromIntegral ch) (fromIntegral bps) (fromIntegral sr)
                     dur (getMetaString tit) (getMetaString art)
 
-metaList = [ ('c', ( (\meta -> show $ channels meta)
+metaList = [ ('c', ( (\meta _ _ -> show $ channels meta)
              , "channels")
              )
-           , ('b', ( (\meta -> show $ bps meta)
+           , ('b', ( (\meta _ _ -> show $ bps meta)
              , "bits per sample")
              )
-           , ('s', ( (\meta -> show $ sampleRate meta)
+           , ('s', ( (\meta _ _ -> show $ sampleRate meta)
              , "sample rate")
              )
-           , ('d', ( (\meta -> show $ getDurationPretty $ duration meta)
+           , ('d', ( (\meta _ _ -> show $ getDurationPretty $ duration meta)
              , "duration")
              )
-           , ('t', ( (\meta -> unpack $ title meta)
+           , ('t', ( (\meta _ _ -> unpack $ title meta)
              , "song title")
              )
-           , ('a', ( (\meta -> unpack $ artist meta)
+           , ('a', ( (\meta _ _ -> unpack $ artist meta)
              , "song artist")
+             )
+           , ('f', ( (\_ (_, fn) _ -> show $ fn)
+             , "file name")
+             )
+           , ('n', ( (\_ (no, _) _ -> show $ no)
+             , "playlist track number")
+             )
+           , ('N', ( (\_ _ totl -> show $ totl)
+             , "total number of playlist items")
              )
            ]
 
 metaMap = Map.fromList metaList
 
-formatMeta :: String -> MDMeta -> String
-formatMeta part meta
+formatMeta :: String -> MDMeta -> (Int, FilePath) -> Int -> String
+formatMeta part meta (no, fname) plen
     | length part < 2   = part
     | otherwise         = case head part of
                 '%'     -> let part'    = drop 2 part
                                fmt      = take 2 part
-                           in (mapMeta fmt meta) ++ (formatMeta part' meta)
+                               newstr   = mapMeta fmt meta (no, fname) plen
+                           in (maybe fmt id newstr) ++ (formatMeta part' meta
+                                                                   (no, fname)
+                                                                   plen)
 
                 _       -> let (x:xs)   = part
-                           in x:(formatMeta xs meta)
-    where mapMeta :: String -> MDMeta -> String
-          mapMeta str meta = (fst $ metaMap Map.! (str !! 1)) meta
+                           in x:(formatMeta xs meta (no, fname) plen)
+
+    where mapMeta :: String -> MDMeta -> (Int, FilePath) -> Int -> Maybe String
+          mapMeta str mt nf pl = liftM (\val -> (fst val) mt nf pl)
+                               $ metaMap Map.!? (str !! 1)
 
 getMetaString :: MetaType VorbisComment -> Text
 getMetaString Nothing = pack "Unknown"
@@ -167,9 +181,10 @@ startDecoding' ((no, fname):xs) oldsem pf =
 
         mdWaitCondMaybe oldsem
 
-        runReaderT (pf fpath meta $ putStrLn
-                                  . formatMeta (format opts)
-                                  $ meta) opts
+        (flip runReaderT) opts $ pf fpath meta $ putStrLn
+                                               . formatMeta (format opts)
+                                                            meta (no, fname)
+                                               $ plistLen opts
         mdSignalCond sem
         removeFile fpath
         when playlistEnd $ mdSignalCond (allsem opts)
@@ -210,11 +225,11 @@ withOpenAL action = ask >>= \opts -> liftIO $ void $ runMaybeT $ do
         deinitOpenAL dev ctx src bfs
 
 metaToOpenALFormat :: MDMeta -> Maybe Format
-metaToOpenALFormat meta = Map.fromList [ ((8, 1), Mono8)
-                                        , ((8, 2), Stereo8)
-                                        , ((16, 1), Mono16)
-                                        , ((16, 2), Stereo16)
-                                        ] Map.!? (bps meta, channels meta)
+metaToOpenALFormat meta = Map.fromList [ (( 8, 1), Mono8)
+                                       , (( 8, 2), Stereo8)
+                                       , ((16, 1), Mono16)
+                                       , ((16, 2), Stereo16)
+                                       ] Map.!? (bps meta, channels meta)
 
 loadBuffs' :: Int -> MDData -> Int -> Format -> Int -> Int -> IO MDBuffT
 loadBuffs' bfn mddata rate format cnt bfsize
@@ -381,7 +396,6 @@ showHelp = mapM_ putStrLn $ concat
         [ "" ]
     ]
 
-
 optMap = Map.fromList optList
 
 getOpts' :: Maybe Char -> MDOpts -> [String] -> IO (Maybe MDOpts)
@@ -415,7 +429,7 @@ main = getArgs >>= \args -> do
             let opts'    = drop pllen args
 
             allsem      <- mdInitCond
-            let defOpts  = MDOpts 4 4096 "%a - %t\n%d" pl pllen
+            let defOpts  = MDOpts 4 4096 "(%n/%N) %a - %t (%d)" pl pllen
                                  allsem MDOpenAL (MDDelay 0.0 0.75)
 
             void $ liftIO $ runMaybeT $ do
