@@ -7,7 +7,7 @@ import System.Directory (removeFile, getCurrentDirectory)
 import Control.Concurrent (forkIO, threadDelay, ThreadId)
 import Data.Text (Text, pack, unpack)
 import System.Process
-import Control.Monad (liftM, void, mzero, unless, when, join, mapM_)
+import Control.Monad (liftM, void, mzero, unless, when, join, mapM_, guard)
 import MDSem
 import MDBuff
 import System.IO (openBinaryFile, Handle, IOMode(..), hClose, hGetBuf, hIsEOF)
@@ -17,6 +17,7 @@ import Foreign.Marshal.Alloc (callocBytes)
 import Sound.OpenAL
 import qualified Data.Map as Map (fromList, (!?), (!))
 import Data.Maybe (isNothing, fromJust)
+import Control.Exception (try, SomeException(..), evaluate)
 
 data MDData = MDData { source       :: Source
                      , buffers      :: [Buffer]
@@ -40,6 +41,7 @@ data MDOpts = MDOpts { buffNum      :: Int
                      , allsem       :: MDSemT
                      , driver       :: MDDriver
                      , delay        :: MDDelay
+                     , decDelay     :: Double
                      }
 
 data MDMeta = MDMeta { channels     :: Int
@@ -175,7 +177,8 @@ startDecoding' ((no, fname):xs) oldsem pf =
         unless (playlistEnd) $ void $ forkIO $ do
                         threadDelay . ((10^6) *)
                                     . floor
-                                    . (0.75 *) . duration $ meta
+                                    . ((decDelay opts) *)
+                                    . duration $ meta
                         runReaderT (startDecoding' xs (Just sem) pf)
                                    opts
 
@@ -341,45 +344,55 @@ getDelayCoeff' _ _ _ = Nothing
 
 getDelayCoeff = getDelayCoeff' ("", "") 'a'
 
-optList = [ ('n', ( (\opts x -> opts { buffNum = read x :: Int } )
+readsMaybe x = case reads x of
+        [(res, [])]     -> Just res
+        _               -> Nothing
+
+optList = [ ('n', ( (\opts x -> liftM (\res -> opts { buffNum = res } )
+                              $ readsMaybe x )
             , "number of buffers")
             )
-          , ('s', ( (\opts x -> opts { buffSize = read x :: Int } )
+          , ('s', ( (\opts x -> liftM (\res -> opts { buffSize = res } )
+                              $ readsMaybe x )
             , "buffer size")
             )
-          , ('f', ( (\opts x -> opts { format = x } )
+          , ('f', ( (\opts x -> Just $ opts { format = x } )
             , "text format")
             )
           , ('l', ( idOpts
             , "open playlist file")
             )
-          , ('d', ( (\opts x -> opts { driver = Map.fromList
-                                             [ ("pacat", MDPacat)
+          , ('D', ( (\opts x -> liftM (\drv -> opts { driver = drv } )
+                              $ Map.fromList [ ("pacat", MDPacat)
                                              , ("openal", MDOpenAL)
-                                             ] Map.! x } )
+                                             ] Map.!? x)
             , "driver (pacat, openal)")
             )
-          , ('t', ( (\opts x -> opts { delay = read x :: MDDelay } )
+          , ('t', ( (\opts x -> liftM (\res -> opts { delay = res } )
+                              $ readsMaybe x)
             , "loop delay (a * buffNum + b)")
+            )
+          , ('d', ( (\opts x -> liftM (\res -> opts { decDelay = res } )
+                              $ readsMaybe x)
+            , "decoder delay (between 0 and 1)")
             )
           , ('h', ( idOpts
             , "show help")
             )
           ]
-    where idOpts opts _ = opts
+    where idOpts opts _ = Just opts
 
 showHelpFor prefix = map (\(ch, (_, help)) -> "\t" ++ (prefix:ch:"\t") ++ help)
 
 showHelp = mapM_ putStrLn $ concat
-    [   [ "" ]
-        ,
+    [
         [ "melodeer-hs is a simple FLAC player written in"
         , "Haskell using OpenAL."
         , ""
         , "melodeer-hs <file_list> [-l <playlist_file>]"
-        , "\t\t[-d pacat|openal] [-f <text_format>]"
-        , "\t\t[-n <buff_num>] [-s <buff_size>]"
-        , "\t\t[-t <loop_delay>] [-h]"
+        , "\t\t[-D pacat|openal] [-f <text_format>]"
+        , "\t\t[-n <buff_num>] [-s <buff_size>] [-h]"
+        , "\t\t[-t <loop_delay>] [-d <decoder_delay>]"
         , ""
         , "Options:"
         , ""
@@ -392,8 +405,6 @@ showHelp = mapM_ putStrLn $ concat
         , "Text format can take following fields:"
         , ""
         ], showHelpFor '%' metaList
-        ,
-        [ "" ]
     ]
 
 optMap = Map.fromList optList
@@ -402,7 +413,10 @@ getOpts' :: Maybe Char -> MDOpts -> [String] -> IO (Maybe MDOpts)
 getOpts' Nothing part [] = return $ Just part
 getOpts' _ _ [] = return Nothing
 getOpts' Nothing part (x:xs)
-    | head x /= '-' || length x /= 2    = return Nothing
+    | head x /= '-' || length x /= 2    = do
+                                    putStrLn $ "Invalid command line usage."
+                                            ++ "Try -h for help."
+                                    return Nothing
     | otherwise                         = return
                                         =<< getOpts' (Just (x !! 1)) part xs
 getOpts' (Just ch) opts (x:xs) = case ch of
@@ -411,11 +425,22 @@ getOpts' (Just ch) opts (x:xs) = case ch of
         in getOpts' Nothing (opts { playlist = newpl
                                   , plistLen = length newpl
                                   }) xs) =<< liftM lines (readFile x)
-    'h'     -> return Nothing
+    'h'     -> do
+            showHelp
+            return Nothing
 
-    _       -> maybe (return Nothing)
-                     (\val -> getOpts' Nothing ((fst val) opts x) xs)
-                     (optMap Map.!? ch)
+    cmd     -> maybe (do
+                        putStrLn $ "Invalid option: \"" ++ '-':[cmd]
+                                ++ "\". Try -h for help."
+                        return Nothing)
+                     (\val -> case (fst val) opts x of
+                            Nothing     -> do
+                                putStrLn $ "Invalid argument \"" ++ x
+                                        ++ "\" for option \"" ++ '-':[cmd]
+                                        ++ "\". Try -h for help."
+                                return Nothing
+                            Just opts'  -> getOpts' Nothing opts' xs
+                     ) (optMap Map.!? ch)
 
 getOpts :: MDOpts -> [String] -> IO (Maybe MDOpts)
 getOpts = getOpts' Nothing
@@ -430,16 +455,24 @@ main = getArgs >>= \args -> do
 
             allsem      <- mdInitCond
             let defOpts  = MDOpts 4 4096 "(%n/%N) %a - %t (%d)" pl pllen
-                                 allsem MDOpenAL (MDDelay 0.0 0.75)
+                                 allsem MDOpenAL (MDDelay 0.0 0.75) 0.75
 
             void $ liftIO $ runMaybeT $ do
-                opts    <- obtainResource (getOpts defOpts opts')
-                                          "" showHelp
+
+                opts    <- obtainResource (getOpts defOpts opts') ""
+                                          (return ())
+
+                unless (plistLen opts /= 0) $ liftIO
+                                            $ putStrLn $ "No files added to "
+                                           ++ "playlist. Try -h for help."
+                guard (plistLen opts /= 0)
 
                 void $ liftIO $ (flip runReaderT) opts $ case driver opts of
+
                     MDOpenAL    -> withOpenAL $ \src bfs -> do
                                         startDecoding (playFile src bfs)
                                         liftIO $ mdWaitCond allsem
+
                     MDPacat     -> do
                             startDecoding playFilePacat
                             liftIO $ mdWaitCond allsem
