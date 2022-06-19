@@ -411,24 +411,29 @@ optMap = Map.fromList optList
 
 getOpts' :: Maybe Char -> MDOpts -> [String] -> IO (Maybe MDOpts)
 getOpts' Nothing part [] = return $ Just part
-getOpts' _ _ [] = return Nothing
-getOpts' Nothing part (x:xs)
+getOpts' Nothing part a@(x:xs)
     | head x /= '-' || length x /= 2    = do
-                                    putStrLn $ "Invalid command line usage."
-                                            ++ "Try -h for help."
+                                    invalidUsage
                                     return Nothing
-    | otherwise                         = return
-                                        =<< getOpts' (Just (x !! 1)) part xs
+    | otherwise                         = case (x !! 1) of
+
+        'h'     -> do
+            showHelp
+            return Nothing
+        _       -> case a of
+                    (x:[])  -> do
+                            invalidUsage
+                            return Nothing
+                    (x:xs)  -> return =<< getOpts' (Just (x !! 1)) part xs
+
+    where invalidUsage = putStrLn "Invalid command line usage. Try -h for help."
+
 getOpts' (Just ch) opts (x:xs) = case ch of
     'l'     -> return =<< (\pl ->
         let newpl = zip [1..] ((snd . unzip . playlist $ opts) ++ pl)
         in getOpts' Nothing (opts { playlist = newpl
                                   , plistLen = length newpl
                                   }) xs) =<< liftM lines (readFile x)
-    'h'     -> do
-            showHelp
-            return Nothing
-
     cmd     -> maybe (do
                         putStrLn $ "Invalid option: \"" ++ '-':[cmd]
                                 ++ "\". Try -h for help."
